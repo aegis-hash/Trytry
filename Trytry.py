@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import html
 import importlib
@@ -21,11 +22,57 @@ import streamlit as st
 import aegisultra_enginev2 as aegis
 
 
-# Always synchronize the in-memory engine module
-# with the current engine file on disk.
-importlib.invalidate_caches()
+# Synchronize the in-memory engine module with the current
+# engine file on disk, but do not reload it on every Streamlit
+# widget rerun. The fingerprint is stored directly on the
+# imported module, which survives normal Streamlit reruns.
+def synchronize_engine_module(module: Any) -> Any:
+    module_path = getattr(
+        module,
+        "__file__",
+        "",
+    )
 
-aegis = importlib.reload(
+    if not module_path:
+        return module
+
+    try:
+        with open(
+            module_path,
+            "rb",
+        ) as engine_file:
+            disk_fingerprint = hashlib.sha256(
+                engine_file.read()
+            ).hexdigest()
+
+    except OSError:
+        return module
+
+    loaded_fingerprint = getattr(
+        module,
+        "__aegis_disk_fingerprint__",
+        "",
+    )
+
+    if loaded_fingerprint == disk_fingerprint:
+        return module
+
+    importlib.invalidate_caches()
+
+    synchronized_module = importlib.reload(
+        module
+    )
+
+    setattr(
+        synchronized_module,
+        "__aegis_disk_fingerprint__",
+        disk_fingerprint,
+    )
+
+    return synchronized_module
+
+
+aegis = synchronize_engine_module(
     aegis
 )
 
@@ -1322,18 +1369,42 @@ for state_key, state_value in SESSION_DEFAULTS.items():
         st.session_state[state_key] = state_value
 
 
+PORTAL_EDITOR_STATE_PREFIXES = (
+    "portal_publish_pick_",
+    "portal_publish_tier_",
+    "portal_publish_commentary_",
+    "portal_manual_model_direction_",
+)
+
+
+def clear_portal_editor_state() -> None:
+    stale_keys = [
+        key
+        for key in list(
+            st.session_state.keys()
+        )
+        if any(
+            str(key).startswith(prefix)
+            for prefix
+            in PORTAL_EDITOR_STATE_PREFIXES
+        )
+    ]
+
+    for key in stale_keys:
+        del st.session_state[key]
+
+
 # ============================================================
-# 7. Cached engine execution
+# 7. Session-scoped engine execution
 # ============================================================
 
-@st.cache_data(
-    show_spinner=False,
-    max_entries=32,
-)
 def cached_engine_run(
     canonical_json: str,
     engine_fingerprint: str,
 ) -> Dict[str, Any]:
+    # The engine fingerprint remains part of the call contract
+    # and analysis hash, but complete engine results are no
+    # longer stored in Streamlit's global data cache.
     del engine_fingerprint
 
     return aegis.run_engine(
@@ -1404,6 +1475,19 @@ def execute_engine(
     ):
         return st.session_state.ultra_result
 
+    # A different analysis replaces the previous session result.
+    # Release old model scenarios and obsolete publisher widget
+    # state before constructing another potentially large result.
+    if (
+        st.session_state.ultra_analysis_hash
+        != analysis_hash
+    ):
+        st.session_state.ultra_result = None
+        st.session_state.ultra_input = None
+
+        clear_portal_editor_state()
+        gc.collect()
+
     result = cached_engine_run(
         canonical_json,
         engine_fingerprint,
@@ -1415,9 +1499,20 @@ def execute_engine(
 
     st.session_state.ultra_result = result
 
-    st.session_state.ultra_input = result.get(
-        "input_snapshot",
-        deepcopy(input_data),
+    input_snapshot = result.get(
+        "input_snapshot"
+    )
+
+    if not isinstance(
+        input_snapshot,
+        dict,
+    ):
+        input_snapshot = deepcopy(
+            input_data
+        )
+
+    st.session_state.ultra_input = (
+        input_snapshot
     )
 
     return result
@@ -3195,6 +3290,9 @@ def build_portal_bundle(
             )
         ),
         "status": publish_status,
+        # Never automatically publish the engine's original
+        # betting direction. The publisher must enter the
+        # final direction manually, or leave it blank.
         "model_direction": optional_text(
             model_direction_override
         ),
@@ -3650,14 +3748,15 @@ with st.sidebar:
         "🗑️ 清除目前分析",
         use_container_width=True,
     ):
-        cached_engine_run.clear()
-
         st.session_state.ultra_result = None
         st.session_state.ultra_input = None
         st.session_state.ultra_analysis_hash = None
         st.session_state.ultra_error = None
         st.session_state.ultra_traceback = None
         st.session_state.portal_last_response = None
+
+        clear_portal_editor_state()
+        gc.collect()
 
         st.rerun()
 
@@ -4185,101 +4284,218 @@ if input_mode == "🎛️ 批量貼上":
                 "sharp_books": sharp_books,
                 "hkjc_markets": hkjc_markets,
                 "settings": {
-                    "minimum_odds": minimum_odds,
-                    "maximum_odds": maximum_odds,
-                    "max_recommendations": safe_int(
-                        maximum_recommendations,
-                        3,
+                    "primary_source": primary_source,
+                    "minimum_odds": float(
+                        minimum_odds
+                    ),
+                    "maximum_odds": (
+                        float(maximum_odds)
+                        if maximum_odds
+                        is not None
+                        else None
+                    ),
+                    "max_recommendations": int(
+                        maximum_recommendations
                     ),
                     "minimum_official_hit_probability": (
-                        minimum_hit_probability_pct / 100.0
+                        float(
+                            minimum_hit_probability_pct
+                        )
+                        / 100.0
                     ),
-                    "correct_score_count": safe_int(
-                        correct_score_count,
-                        2,
+                    "correct_score_count": int(
+                        correct_score_count
                     ),
-                    "devig_methods": devig_methods,
-                    "primary_source": primary_source,
+                    "devig_methods": list(
+                        devig_methods
+                    ),
                     "ev_rejection_floor": (
-                        (ev_floor_pct / 100.0)
+                        float(ev_floor_pct)
+                        / 100.0
                         if use_ev_floor
                         else None
                     ),
                     "features": {
-                        "quality_gate": quality_gate,
-                        "stress_audit": stress_audit,
-                        "family_out_audit": family_out_audit,
-                        "adaptive_grids": adaptive_grids,
-                        "ht_ft_coherence": ht_ft_coherence,
+                        "quality_gate": bool(
+                            quality_gate
+                        ),
+                        "stress_audit": bool(
+                            stress_audit
+                        ),
+                        "family_out_audit": bool(
+                            family_out_audit
+                        ),
+                        "adaptive_grids": bool(
+                            adaptive_grids
+                        ),
+                        "ht_ft_coherence": bool(
+                            ht_ft_coherence
+                        ),
                     },
                 },
             }
-        except Exception as err:
-            st.error(f"輸入格式錯誤：{err}")
-            st.session_state.ultra_error = str(err)
-            st.session_state.ultra_traceback = traceback.format_exc()
+
+            input_preview = deepcopy(
+                input_to_run
+            )
+
+        except Exception as input_error:
+            st.session_state.ultra_error = str(
+                input_error
+            )
+
+            st.session_state.ultra_traceback = (
+                traceback.format_exc()
+            )
+
+            st.error(
+                f"輸入錯誤：{input_error}"
+            )
+
 
 elif input_mode == "📋 貼上 JSON":
     st.markdown(
-        '<div class="section-label">JSON String Input</div>',
+        '<div class="section-label">Direct JSON input</div>',
         unsafe_allow_html=True,
     )
-    json_str = st.text_area(
-        "貼上 JSON 設定資料",
-        value=st.session_state.get(
-            "ultra_json_text",
-            json_text(example_json_input()),
-        ),
-        height=400,
-        key="ultra_json_area",
+
+    st.markdown(
+        """
+        <div class="info-panel">
+            直接貼上完整 AEGIS ULTRA V2 輸入 JSON。
+            period 必須明確保留於每個 HKJC 候選盤。
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if st.button(
-        "🚀 執行 JSON 分析",
+    json_input_value = st.text_area(
+        "AEGIS ULTRA 輸入 JSON",
+        key="ultra_json_text",
+        height=650,
+    )
+
+    run_json = st.button(
+        "🚀 執行貼上的 JSON",
         type="primary",
         use_container_width=True,
         key="ultra_json_run",
-    ):
-        try:
-            parsed_data = json.loads(json_str)
-            if not isinstance(parsed_data, dict):
-                raise ValueError("JSON 頂層必須是物件 (dict)。")
-            input_to_run = parsed_data
-            st.session_state.ultra_json_text = json_str
-        except Exception as err:
-            st.error(f"JSON 解析錯誤：{err}")
-            st.session_state.ultra_error = str(err)
-            st.session_state.ultra_traceback = traceback.format_exc()
+    )
 
-elif input_mode == "📁 上載 JSON":
+    if run_json:
+        try:
+            parsed_json = json.loads(
+                json_input_value
+            )
+
+            if not isinstance(
+                parsed_json,
+                dict,
+            ):
+                raise ValueError(
+                    "JSON 最外層必須是物件。"
+                )
+
+            input_to_run = parsed_json
+            input_preview = deepcopy(
+                parsed_json
+            )
+
+        except Exception as json_error:
+            st.session_state.ultra_error = str(
+                json_error
+            )
+
+            st.session_state.ultra_traceback = (
+                traceback.format_exc()
+            )
+
+            st.error(
+                f"JSON 錯誤：{json_error}"
+            )
+
+
+else:
     st.markdown(
-        '<div class="section-label">JSON File Upload</div>',
+        '<div class="section-label">JSON file input</div>',
         unsafe_allow_html=True,
     )
+
     uploaded_file = st.file_uploader(
-        "選擇 JSON 檔案",
+        "上載 AEGIS ULTRA JSON",
         type=["json"],
-        key="ultra_file_uploader",
     )
+
+    uploaded_preview = None
 
     if uploaded_file is not None:
         try:
-            file_contents = uploaded_file.read().decode("utf-8")
-            parsed_data = json.loads(file_contents)
-            st.json(parsed_data, expanded=False)
+            uploaded_text = (
+                uploaded_file
+                .getvalue()
+                .decode("utf-8-sig")
+            )
 
-            if st.button(
-                "🚀 執行上載 JSON 分析",
-                type="primary",
-                use_container_width=True,
-                key="ultra_upload_run",
+            uploaded_preview = json.loads(
+                uploaded_text
+            )
+
+            st.success(
+                f"已讀取：{uploaded_file.name}"
+            )
+
+            with st.expander(
+                "檢查上載內容",
+                expanded=False,
             ):
-                input_to_run = parsed_data
-                st.session_state.ultra_json_text = file_contents
-        except Exception as err:
-            st.error(f"檔案讀取或 JSON 解析錯誤：{err}")
-            st.session_state.ultra_error = str(err)
-            st.session_state.ultra_traceback = traceback.format_exc()
+                st.json(uploaded_preview)
+
+        except Exception as preview_error:
+            uploaded_preview = None
+
+            st.error(
+                f"無法讀取 JSON：{preview_error}"
+            )
+
+    run_uploaded = st.button(
+        "🚀 執行上載的 JSON",
+        type="primary",
+        use_container_width=True,
+        key="ultra_upload_run",
+    )
+
+    if run_uploaded:
+        try:
+            if uploaded_preview is None:
+                raise ValueError(
+                    "請先上載有效的 JSON 檔案。"
+                )
+
+            if not isinstance(
+                uploaded_preview,
+                dict,
+            ):
+                raise ValueError(
+                    "JSON 最外層必須是物件。"
+                )
+
+            input_to_run = uploaded_preview
+            input_preview = deepcopy(
+                uploaded_preview
+            )
+
+        except Exception as upload_error:
+            st.session_state.ultra_error = str(
+                upload_error
+            )
+
+            st.session_state.ultra_traceback = (
+                traceback.format_exc()
+            )
+
+            st.error(
+                f"JSON 錯誤：{upload_error}"
+            )
 
 
 # ============================================================
@@ -4352,1408 +4568,1431 @@ if st.session_state.ultra_error:
 # 17. Results
 # ============================================================
 
-result = st.session_state.ultra_result
+_RESULT_FRAGMENT = getattr(
+    st,
+    "fragment",
+    lambda function: function,
+)
 
-if result:
-    st.divider()
 
-    st.markdown(
-        '<div class="section-label">Analysis result</div>',
-        unsafe_allow_html=True,
-    )
-
-    match = result.get(
-        "match",
-        {},
-    )
-
-    match_name = match.get(
-        "name",
-        "賽事分析",
-    )
-
-    st.header(
-        f"📡 {match_name}"
-    )
-
-    caption_parts = [
-        match.get("competition"),
-        match.get("kickoff"),
-        match.get("snapshot_time"),
-    ]
-
-    caption = " ｜ ".join(
-        str(value)
-        for value in caption_parts
-        if value
-    )
-
-    if caption:
-        st.caption(caption)
-
-    recommendations = result.get(
-        "recommendations",
-        [],
-    )
-
-    candidates = result.get(
-        "candidate_markets",
-        [],
-    )
-
-    quality_status = (
-        result
-        .get(
-            "model_quality",
-            {},
-        )
-        .get(
-            "status",
-            "UNKNOWN",
-        )
-    )
-
-    coherence_status = (
-        result
-        .get(
-            "ht_ft_coherence",
-            {},
-        )
-        .get(
-            "status",
-            "NOT_AVAILABLE",
-        )
-    )
-
-    runtime_seconds = (
-        result
-        .get(
-            "runtime",
-            {},
-        )
-        .get("total_seconds")
-    )
-
-    first, second, third, fourth = st.columns(4)
-
-    with first:
-        result_summary_card(
-            "模型品質",
-            status_chinese(
-                quality_status
-            ),
-            "市場重建及網格品質",
-            status_css_class(
-                quality_status
-            ),
+def rerun_results_fragment() -> None:
+    # Streamlit 1.37+ supports fragment-scoped reruns.
+    # Fall back to a normal rerun on older installations.
+    try:
+        st.rerun(
+            scope="fragment"
         )
 
-    with second:
-        result_summary_card(
-            "正式推薦",
-            str(len(recommendations)),
-            f"共分析 {len(candidates)} 個候選盤",
+    except TypeError:
+        st.rerun()
+
+
+@_RESULT_FRAGMENT
+def render_results_fragment() -> None:
+    result = st.session_state.ultra_result
+
+    if result:
+        st.divider()
+
+        st.markdown(
+            '<div class="section-label">Analysis result</div>',
+            unsafe_allow_html=True,
         )
 
-    with third:
-        result_summary_card(
-            "HT–FT 一致性",
-            status_chinese(
-                coherence_status
-            ),
-            "半場與全場模型一致性",
-            status_css_class(
-                coherence_status
-            ),
-        )
-
-    with fourth:
-        result_summary_card(
-            "執行時間",
-            (
-                f"{float(runtime_seconds):.2f} 秒"
-                if runtime_seconds
-                is not None
-                else "—"
-            ),
-            f"Engine V{ENGINE_VERSION}",
-        )
-
-    st.markdown("### 結果頁面")
-
-    result_section = st.radio(
-        "選擇要顯示的結果部分",
-        options=[
-            "正式推薦",
-            "所有候選盤",
-            "穩健性分析",
-            "推薦組合",
-            "波膽參考",
-            "模型診斷",
-            "發佈到 VIP App",
-            "完整 JSON",
-        ],
-        horizontal=True,
-        key="ultra_result_section",
-        label_visibility="collapsed",
-    )
-
-    st.caption(
-        "為改善效能，系統只會載入目前選擇的結果部分。"
-    )
-
-    if result_section == "正式推薦":
-        st.subheader("正式推薦")
-
-        if recommendations:
-            sorted_recommendations = sorted(
-                recommendations,
-                key=lambda item: (
-                    PERIOD_ORDER.get(
-                        normalize_period(
-                            item.get("period")
-                        ),
-                        9,
-                    ),
-                    safe_int(
-                        item.get(
-                            "rank",
-                            item.get(
-                                "official_rank"
-                            ),
-                        ),
-                        999,
-                    ),
-                ),
-            )
-
-            for recommendation in (
-                sorted_recommendations
-            ):
-                recommendation_card(
-                    recommendation
-                )
-        else:
-            st.warning(
-                "沒有候選盤通過所有正式推薦條件。"
-            )
-
-    elif result_section == "所有候選盤":
-        st.subheader("所有候選盤")
-
-        candidate_table = (
-            candidate_dataframe(
-                candidates
-            )
-        )
-
-        if candidate_table.empty:
-            st.info("沒有候選盤結果。")
-        else:
-            st.dataframe(
-                candidate_table,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "HKJC 賠率": (
-                        st.column_config
-                        .NumberColumn(
-                            "HKJC 賠率",
-                            format="%.3f",
-                        )
-                    ),
-                },
-            )
-
-    elif result_section == "穩健性分析":
-        st.subheader("穩健性分析")
-
-        if not candidates:
-            st.info(
-                "沒有候選盤可分析。"
-            )
-        else:
-            labels = [
-                (
-                    f"{item_identity(candidate) or '—'}｜"
-                    f"{normalize_period(candidate.get('period'))}｜"
-                    f"{candidate.get('label', '—')}"
-                )
-                for candidate in candidates
-            ]
-
-            selected_label = st.selectbox(
-                "選擇候選盤",
-                options=labels,
-                key="ultra_robustness_candidate",
-            )
-
-            selected_candidate = candidates[
-                labels.index(selected_label)
-            ]
-
-            family_audit = (
-                selected_candidate.get(
-                    "family_out_audit",
-                    {},
-                )
-            )
-
-            family_status = family_audit.get(
-                "status",
-                "NOT_TESTABLE",
-            )
-
-            family_hit = (
-                family_audit
-                .get(
-                    "probability",
-                    {},
-                )
-                .get(
-                    "hit",
-                    {},
-                )
-            )
-
-            first, second, third, fourth = st.columns(4)
-
-            first.metric(
-                "整族移除狀態",
-                status_chinese(
-                    family_status
-                ),
-            )
-
-            second.metric(
-                "整族移除最低命中率",
-                format_probability(
-                    family_hit.get("minimum")
-                ),
-            )
-
-            third.metric(
-                "整族移除中位命中率",
-                format_probability(
-                    family_hit.get("median")
-                ),
-            )
-
-            fourth.metric(
-                "整族移除最高命中率",
-                format_probability(
-                    family_hit.get("maximum")
-                ),
-            )
-
-            stress_status = (
-                selected_candidate
-                .get(
-                    "stress_audit",
-                    {},
-                )
-                .get("status")
-            )
-
-            if stress_status in {
-                "DISABLED",
-                "NOT_TESTABLE",
-            }:
-                st.info(
-                    "壓力測試："
-                    + status_chinese(
-                        stress_status
-                    )
-                )
-            else:
-                st.dataframe(
-                    stress_dataframe(
-                        selected_candidate
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    elif result_section == "推薦組合":
-        st.subheader("推薦組合分析")
-
-        recommendation_set = result.get(
-            "recommendation_set",
+        match = result.get(
+            "match",
             {},
         )
 
-        first, second, third = st.columns(3)
-
-        first.metric(
-            "全部命中最低概率",
-            format_probability(
-                recommendation_set
-                .get(
-                    "all_hit_probability",
-                    {},
-                )
-                .get("minimum")
-            ),
+        match_name = match.get(
+            "name",
+            "賽事分析",
         )
 
-        second.metric(
-            "最少一項命中最低概率",
-            format_probability(
-                recommendation_set
-                .get(
-                    "at_least_one_hit_probability",
-                    {},
-                )
-                .get("minimum")
-            ),
+        st.header(
+            f"📡 {match_name}"
         )
 
-        third.metric(
-            "全部不命中最高概率",
-            format_probability(
-                recommendation_set
-                .get(
-                    "all_miss_probability",
-                    {},
-                )
-                .get("maximum")
-            ),
+        caption_parts = [
+            match.get("competition"),
+            match.get("kickoff"),
+            match.get("snapshot_time"),
+        ]
+
+        caption = " ｜ ".join(
+            str(value)
+            for value in caption_parts
+            if value
         )
 
-        st.info(
-            "組合分析狀態："
-            + status_chinese(
-                recommendation_set.get(
-                    "status",
-                    "NOT_AVAILABLE",
-                )
-            )
-        )
+        if caption:
+            st.caption(caption)
 
-        if recommendation_set.get(
-            "pair_compatibility"
-        ):
-            st.json(
-                recommendation_set[
-                    "pair_compatibility"
-                ]
-            )
-
-    elif result_section == "波膽參考":
-        st.subheader("🎯 高風險波膽參考")
-
-        correct_scores = result.get(
-            "correct_scores",
-            {},
-        )
-
-        st.warning(
-            correct_scores.get(
-                "warning",
-                "波膽屬高風險及低命中率市場。",
-            )
-        )
-
-        score_records = correct_scores.get(
+        recommendations = result.get(
             "recommendations",
             [],
         )
 
-        if score_records:
-            score_columns = st.columns(
-                len(score_records)
+        candidates = result.get(
+            "candidate_markets",
+            [],
+        )
+
+        quality_status = (
+            result
+            .get(
+                "model_quality",
+                {},
+            )
+            .get(
+                "status",
+                "UNKNOWN",
+            )
+        )
+
+        coherence_status = (
+            result
+            .get(
+                "ht_ft_coherence",
+                {},
+            )
+            .get(
+                "status",
+                "NOT_AVAILABLE",
+            )
+        )
+
+        runtime_seconds = (
+            result
+            .get(
+                "runtime",
+                {},
+            )
+            .get("total_seconds")
+        )
+
+        first, second, third, fourth = st.columns(4)
+
+        with first:
+            result_summary_card(
+                "模型品質",
+                status_chinese(
+                    quality_status
+                ),
+                "市場重建及網格品質",
+                status_css_class(
+                    quality_status
+                ),
             )
 
-            for column, score in zip(
-                score_columns,
-                score_records,
-            ):
-                probability = score.get(
-                    "probability",
-                    {},
-                )
+        with second:
+            result_summary_card(
+                "正式推薦",
+                str(len(recommendations)),
+                f"共分析 {len(candidates)} 個候選盤",
+            )
 
-                with column:
-                    st.markdown(
-                        f"""
-                        <div class="score-card">
-                            <div class="score-value">
-                                {html_escape(score.get("score", "—"))}
-                            </div>
-                            <div class="score-probability">
-                                保守概率
-                                {format_probability(
-                                    probability.get("minimum"),
-                                    2
-                                )}
-                            </div>
-                            <div style="
-                                color: rgba(255,255,255,0.52);
-                                margin-top: 0.4rem;
-                                font-size: 0.82rem;
-                            ">
-                                中位
-                                {format_probability(
-                                    probability.get("median"),
-                                    2
-                                )}
-                                · 公平賠率
-                                {format_odds(
-                                    score.get("central_fair_odds"),
-                                    2
-                                )}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-        else:
-            st.info("沒有波膽參考。")
+        with third:
+            result_summary_card(
+                "HT–FT 一致性",
+                status_chinese(
+                    coherence_status
+                ),
+                "半場與全場模型一致性",
+                status_css_class(
+                    coherence_status
+                ),
+            )
 
-    elif result_section == "模型診斷":
-        st.subheader("模型診斷")
+        with fourth:
+            result_summary_card(
+                "執行時間",
+                (
+                    f"{float(runtime_seconds):.2f} 秒"
+                    if runtime_seconds
+                    is not None
+                    else "—"
+                ),
+                f"Engine V{ENGINE_VERSION}",
+            )
+
+        st.markdown("### 結果頁面")
+
+        result_section = st.radio(
+            "選擇要顯示的結果部分",
+            options=[
+                "正式推薦",
+                "所有候選盤",
+                "穩健性分析",
+                "推薦組合",
+                "波膽參考",
+                "模型診斷",
+                "發佈到 VIP App",
+                "完整 JSON",
+            ],
+            horizontal=True,
+            key="ultra_result_section",
+            label_visibility="collapsed",
+        )
 
         st.caption(
-            "基本模型摘要會立即顯示。"
-            "大型情境資料表只會在你明確啟用後載入。"
+            "為改善效能，系統只會載入目前選擇的結果部分。"
         )
 
-        show_full_scenario_tables = st.checkbox(
-            "載入完整模型情境資料表",
-            value=False,
-            key="ultra_show_full_scenario_tables",
-            help=(
-                "完整情境資料可能很大。"
-                "只有需要檢查每個模型情境時才啟用。"
-            ),
-        )
+        if result_section == "正式推薦":
+            st.subheader("正式推薦")
 
-        model = result.get(
-            "model",
-            {},
-        )
-
-        periods = model.get(
-            "periods",
-            {},
-        )
-
-        if periods:
-            for period, section in sorted(
-                periods.items(),
-                key=lambda item: PERIOD_ORDER.get(
-                    normalize_period(
-                        item[0]
+            if recommendations:
+                sorted_recommendations = sorted(
+                    recommendations,
+                    key=lambda item: (
+                        PERIOD_ORDER.get(
+                            normalize_period(
+                                item.get("period")
+                            ),
+                            9,
+                        ),
+                        safe_int(
+                            item.get(
+                                "rank",
+                                item.get(
+                                    "official_rank"
+                                ),
+                            ),
+                            999,
+                        ),
                     ),
-                    9,
-                ),
-            ):
-                period_name = (
-                    "全場 FT"
-                    if period == "FT"
-                    else (
-                        "半場 HT"
-                        if period == "HT"
-                        else period
+                )
+
+                for recommendation in (
+                    sorted_recommendations
+                ):
+                    recommendation_card(
+                        recommendation
+                    )
+            else:
+                st.warning(
+                    "沒有候選盤通過所有正式推薦條件。"
+                )
+
+        elif result_section == "所有候選盤":
+            st.subheader("所有候選盤")
+
+            candidate_table = (
+                candidate_dataframe(
+                    candidates
+                )
+            )
+
+            if candidate_table.empty:
+                st.info("沒有候選盤結果。")
+            else:
+                st.dataframe(
+                    candidate_table,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "HKJC 賠率": (
+                            st.column_config
+                            .NumberColumn(
+                                "HKJC 賠率",
+                                format="%.3f",
+                            )
+                        ),
+                    },
+                )
+
+        elif result_section == "穩健性分析":
+            st.subheader("穩健性分析")
+
+            if not candidates:
+                st.info(
+                    "沒有候選盤可分析。"
+                )
+            else:
+                labels = [
+                    (
+                        f"{item_identity(candidate) or '—'}｜"
+                        f"{normalize_period(candidate.get('period'))}｜"
+                        f"{candidate.get('label', '—')}"
+                    )
+                    for candidate in candidates
+                ]
+
+                selected_label = st.selectbox(
+                    "選擇候選盤",
+                    options=labels,
+                    key="ultra_robustness_candidate",
+                )
+
+                selected_candidate = candidates[
+                    labels.index(selected_label)
+                ]
+
+                family_audit = (
+                    selected_candidate.get(
+                        "family_out_audit",
+                        {},
                     )
                 )
 
-                st.markdown(
-                    f"### {period_name}"
+                family_status = family_audit.get(
+                    "status",
+                    "NOT_TESTABLE",
+                )
+
+                family_hit = (
+                    family_audit
+                    .get(
+                        "probability",
+                        {},
+                    )
+                    .get(
+                        "hit",
+                        {},
+                    )
                 )
 
                 first, second, third, fourth = st.columns(4)
 
                 first.metric(
-                    "每隊最高入球",
-                    section.get(
-                        "max_goals_per_team",
-                        "—",
+                    "整族移除狀態",
+                    status_chinese(
+                        family_status
                     ),
                 )
 
                 second.metric(
-                    "狀態數",
-                    section.get(
-                        "state_count",
-                        "—",
+                    "整族移除最低命中率",
+                    format_probability(
+                        family_hit.get("minimum")
                     ),
                 )
 
                 third.metric(
-                    "完整情境數",
-                    section.get(
-                        "full_scenario_count",
-                        "—",
+                    "整族移除中位命中率",
+                    format_probability(
+                        family_hit.get("median")
                     ),
                 )
 
                 fourth.metric(
-                    "網格完整",
-                    (
-                        "是"
-                        if section.get(
-                            "grid_complete"
-                        )
-                        else "否"
+                    "整族移除最高命中率",
+                    format_probability(
+                        family_hit.get("maximum")
                     ),
                 )
 
-                full_scenarios = section.get(
-                    "full_scenarios",
-                    [],
+                stress_status = (
+                    selected_candidate
+                    .get(
+                        "stress_audit",
+                        {},
+                    )
+                    .get("status")
                 )
 
-                if (
-                    full_scenarios
-                    and show_full_scenario_tables
-                ):
+                if stress_status in {
+                    "DISABLED",
+                    "NOT_TESTABLE",
+                }:
+                    st.info(
+                        "壓力測試："
+                        + status_chinese(
+                            stress_status
+                        )
+                    )
+                else:
                     st.dataframe(
-                        pd.DataFrame(
-                            full_scenarios
+                        stress_dataframe(
+                            selected_candidate
                         ),
                         use_container_width=True,
                         hide_index=True,
                     )
 
-                elif full_scenarios:
-                    st.caption(
-                        "完整情境資料表尚未載入。"
-                        f"此時段共有 {len(full_scenarios)} 個情境。"
-                    )
+        elif result_section == "推薦組合":
+            st.subheader("推薦組合分析")
 
-                errors = section.get(
-                    "full_scenario_errors",
-                    [],
-                )
-
-                if errors:
-                    st.warning(
-                        f"{period_name} 有 "
-                        f"{len(errors)} 個情境失敗。"
-                    )
-
-                    st.json(errors)
-
-                st.divider()
-
-        with st.expander(
-            "半場－全場一致性詳情",
-            expanded=False,
-        ):
-            st.json(
-                result.get(
-                    "ht_ft_coherence",
-                    {},
-                )
+            recommendation_set = result.get(
+                "recommendation_set",
+                {},
             )
 
-        with st.expander(
-            "方法說明",
-            expanded=False,
-        ):
-            st.json(
-                result.get(
-                    "methodology",
-                    {},
-                )
-            )
-
-    elif result_section == "發佈到 VIP App":
-        st.subheader(
-            "📤 發佈到 VIP Match Centre"
-        )
-
-        st.markdown(
-            """
-            <div class="publish-panel">
-                發佈資料會完全配合 Aegis V2 Portal API：
-                <b>period、market_scope、edge、
-                expected_value、conflict_ids</b>
-                都會輸出到 recommendations 工作表。
-                缺少 period 的候選盤會直接報錯，
-                不會任意當成 FT。
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        first, second = st.columns(2)
-
-        with first:
-            publish_alternatives = st.checkbox(
-                "同時發佈非正式候選盤為進取選擇",
-                value=True,
-                key="portal_publish_alternatives",
-            )
-
-            publish_correct_scores = st.checkbox(
-                "發佈波膽參考",
-                value=True,
-                key="portal_publish_scores",
-            )
-
-        with second:
-            publish_status = st.selectbox(
-                "發佈狀態",
-                options=[
-                    "published",
-                    "draft",
-                ],
-                index=0,
-                key="portal_publish_status",
-            )
-
-            match_id_override = st.text_input(
-                "自訂 match_id",
-                placeholder=(
-                    "留空時使用穩定雜湊 ID"
-                ),
-                key="portal_match_id_override",
-            )
-
-        portal_input_snapshot = (
-            st.session_state.ultra_input
-            or {}
-        )
-
-        publisher_match_id = stable_match_id(
-            result,
-            portal_input_snapshot,
-        )
-
-        publisher_state_suffix = (
-            hashlib.sha256(
-                publisher_match_id.encode(
-                    "utf-8"
-                )
-            ).hexdigest()[:12]
-        )
-
-        st.markdown("### VIP App 投注方向")
-
-        manual_model_direction = st.text_area(
-            "人手設定投注方向",
-            value="",
-            placeholder=(
-                "例如：主隊不敗方向；"
-                "全場入球細為主要部署。"
-            ),
-            height=110,
-            key=(
-                "portal_manual_model_direction_"
-                f"{publisher_state_suffix}"
-            ),
-            help=(
-                "只有這裡輸入的內容會顯示在 VIP App。"
-                "留空時，VIP App 不會顯示投注方向。"
-            ),
-        )
-
-        st.caption(
-            "引擎原本產生的投注方向不會自動發佈。"
-            "請按照最後的人手決定輸入，亦可以留空。"
-        )
-
-        try:
-            portal_bundle = build_portal_bundle(
-                result=result,
-                input_snapshot=(
-                    portal_input_snapshot
-                ),
-                publish_alternatives=(
-                    publish_alternatives
-                ),
-                publish_correct_scores=(
-                    publish_correct_scores
-                ),
-                publish_status=publish_status,
-                match_id_override=(
-                    match_id_override
-                ),
-                model_direction_override=(
-                    manual_model_direction
-                ),
-            )
-
-            bundle_recommendations = portal_bundle[
-                "recommendations"
-            ]
-
-            # ------------------------------------------------
-            # Individual recommendation editing and selection
-            # ------------------------------------------------
-
-            st.markdown("### 選擇及編輯今次發佈項目")
-
-            st.caption(
-                "你可以把候選盤設定為正式推薦或進取選擇，"
-                "並在人手發佈前加入或修改雨姐短評。"
-                "只有已勾選的項目會提交。"
-            )
-
-            select_all_column, clear_column = st.columns(2)
-
-            with select_all_column:
-                if st.button(
-                    "✅ 全選",
-                    use_container_width=True,
-                    key="portal_select_all",
-                ):
-                    for record in bundle_recommendations:
-                        rec_id = record["rec_id"]
-
-                        st.session_state[
-                            f"portal_publish_pick_{rec_id}"
-                        ] = True
-
-                    st.rerun()
-
-            with clear_column:
-                if st.button(
-                    "⬜ 全部取消",
-                    use_container_width=True,
-                    key="portal_clear_all",
-                ):
-                    for record in bundle_recommendations:
-                        rec_id = record["rec_id"]
-
-                        st.session_state[
-                            f"portal_publish_pick_{rec_id}"
-                        ] = False
-
-                    st.rerun()
-
-            selected_rec_ids = set()
-
-            edited_bundle_recommendations: List[
-                Dict[str, Any]
-            ] = []
-
-            tier_names = {
-                "OFFICIAL": "✅ 正式推薦",
-                "ALTERNATIVE": "⚡ 進取選擇",
-                "CORRECT_SCORE": "🎯 波膽參考",
-            }
-
-            period_names = {
-                "FT": "FT 全場",
-                "HT": "HT 半場",
-                "2H": "2H 下半場",
-            }
-
-            editable_tier_options = [
-                "OFFICIAL",
-                "ALTERNATIVE",
-            ]
-
-            for record in bundle_recommendations:
-                rec_id = record["rec_id"]
-
-                editable_record = deepcopy(
-                    record
-                )
-
-                selection_widget_key = (
-                    f"portal_publish_pick_{rec_id}"
-                )
-
-                tier_widget_key = (
-                    f"portal_publish_tier_{rec_id}"
-                )
-
-                commentary_widget_key = (
-                    "portal_publish_commentary_"
-                    f"{rec_id}"
-                )
-
-                if (
-                    selection_widget_key
-                    not in st.session_state
-                ):
-                    # Nothing is selected automatically.
-                    # This prevents accidental publication.
-                    st.session_state[
-                        selection_widget_key
-                    ] = False
-
-                original_tier = optional_text(
-                    record.get("tier")
-                ) or "ALTERNATIVE"
-
-                with st.container(border=True):
-                    checkbox_column, detail_column = (
-                        st.columns([0.08, 0.92])
-                    )
-
-                    with checkbox_column:
-                        selected = st.checkbox(
-                            "選擇",
-                            key=selection_widget_key,
-                            label_visibility="collapsed",
-                        )
-
-                    with detail_column:
-                        period = normalize_period(
-                            record.get("period")
-                        )
-
-                        if (
-                            original_tier
-                            == "CORRECT_SCORE"
-                        ):
-                            edited_tier = (
-                                "CORRECT_SCORE"
-                            )
-
-                            st.markdown(
-                                "**🎯 波膽參考｜"
-                                + period_names.get(
-                                    period,
-                                    period,
-                                )
-                                + "｜"
-                                + html_escape(
-                                    record.get(
-                                        "rec_title",
-                                        "未命名選擇",
-                                    )
-                                )
-                                + "**"
-                            )
-
-                            st.caption(
-                                "波膽項目會保留為波膽參考。"
-                            )
-
-                        else:
-                            default_tier = (
-                                original_tier
-                                if original_tier
-                                in editable_tier_options
-                                else "ALTERNATIVE"
-                            )
-
-                            if (
-                                tier_widget_key
-                                not in st.session_state
-                            ):
-                                st.session_state[
-                                    tier_widget_key
-                                ] = default_tier
-
-                            edited_tier = st.selectbox(
-                                "發佈類別",
-                                options=(
-                                    editable_tier_options
-                                ),
-                                format_func=(
-                                    lambda value: (
-                                        tier_names.get(
-                                            value,
-                                            value,
-                                        )
-                                    )
-                                ),
-                                key=tier_widget_key,
-                            )
-
-                            st.markdown(
-                                "**"
-                                + tier_names.get(
-                                    edited_tier,
-                                    edited_tier,
-                                )
-                                + "｜"
-                                + period_names.get(
-                                    period,
-                                    period,
-                                )
-                                + "｜"
-                                + html_escape(
-                                    record.get(
-                                        "rec_title",
-                                        "未命名選擇",
-                                    )
-                                )
-                                + "**"
-                            )
-
-                        detail_parts = [
-                            (
-                                "市場："
-                                + optional_text(
-                                    record.get("market")
-                                )
-                            ),
-                            (
-                                "選擇："
-                                + optional_text(
-                                    record.get(
-                                        "selection"
-                                    )
-                                )
-                            ),
-                        ]
-
-                        line = record.get("line")
-
-                        if (
-                            line is not None
-                            and optional_text(line)
-                        ):
-                            detail_parts.append(
-                                "盤口："
-                                + optional_text(line)
-                            )
-
-                        odds = safe_float(
-                            record.get("odds")
-                        )
-
-                        if odds is not None:
-                            detail_parts.append(
-                                "賠率："
-                                + format_odds(
-                                    odds,
-                                    3,
-                                )
-                            )
-
-                        hit = record.get(
-                            "conservative_hit"
-                        )
-
-                        if safe_float(hit) is not None:
-                            detail_parts.append(
-                                "保守命中："
-                                + format_probability(
-                                    hit
-                                )
-                            )
-
-                        st.caption(
-                            " ｜ ".join(detail_parts)
-                        )
-
-                        manual_commentary = (
-                            st.text_area(
-                                "人手短評",
-                                value=optional_text(
-                                    record.get(
-                                        "commentary"
-                                    )
-                                ),
-                                placeholder=(
-                                    "輸入要顯示在 VIP App "
-                                    "的雨姐短評；"
-                                    "可修改或清除原有內容。"
-                                ),
-                                height=95,
-                                key=(
-                                    commentary_widget_key
-                                ),
-                            )
-                        )
-
-                editable_record["tier"] = (
-                    edited_tier
-                )
-
-                editable_record["commentary"] = (
-                    optional_text(
-                        manual_commentary
-                    )
-                )
-
-                edited_bundle_recommendations.append(
-                    editable_record
-                )
-
-                if selected:
-                    selected_rec_ids.add(
-                        rec_id
-                    )
-
-            selected_recommendations = [
-                deepcopy(record)
-                for record
-                in edited_bundle_recommendations
-                if record.get("rec_id")
-                in selected_rec_ids
-            ]
-
-            # Rebuild the rank within each manually selected
-            # category so promoted or demoted recommendations
-            # appear in a clean and predictable order.
-            tier_rank_counters = {
-                "OFFICIAL": 1,
-                "ALTERNATIVE": 1,
-                "CORRECT_SCORE": 1,
-            }
-
-            for record in selected_recommendations:
-                tier = optional_text(
-                    record.get("tier")
-                ) or "ALTERNATIVE"
-
-                record["rank"] = (
-                    tier_rank_counters.get(
-                        tier,
-                        1,
-                    )
-                )
-
-                tier_rank_counters[tier] = (
-                    record["rank"] + 1
-                )
-
-            # Remove conflict references pointing to records
-            # that are not included in this publication.
-            selected_id_set = {
-                optional_text(
-                    record.get("rec_id")
-                )
-                for record
-                in selected_recommendations
-                if optional_text(
-                    record.get("rec_id")
-                )
-            }
-
-            for record in selected_recommendations:
-                existing_conflicts = [
-                    value.strip()
-                    for value in optional_text(
-                        record.get(
-                            "conflict_ids"
-                        )
-                    ).split(",")
-                    if value.strip()
-                ]
-
-                record["conflict_ids"] = ",".join(
-                    conflict_id
-                    for conflict_id
-                    in existing_conflicts
-                    if (
-                        conflict_id
-                        in selected_id_set
-                        and conflict_id
-                        != record.get("rec_id")
-                    )
-                )
-
-            # Only selected records are submitted.
-            selected_bundle = deepcopy(
-                portal_bundle
-            )
-
-            selected_bundle[
-                "recommendations"
-            ] = selected_recommendations
-
-            # This means the selected list becomes the complete
-            # published recommendation set for this match.
-            selected_bundle[
-                "replace_recommendations"
-            ] = True
-
-            official_count = sum(
-                1
-                for record in selected_recommendations
-                if record.get("tier") == "OFFICIAL"
-            )
-
-            alternative_count = sum(
-                1
-                for record in selected_recommendations
-                if record.get("tier") == "ALTERNATIVE"
-            )
-
-            score_count = sum(
-                1
-                for record in selected_recommendations
-                if record.get("tier") == "CORRECT_SCORE"
-            )
-
-            ft_count = sum(
-                1
-                for record in selected_recommendations
-                if record.get("period") == "FT"
-            )
-
-            ht_count = sum(
-                1
-                for record in selected_recommendations
-                if record.get("period") == "HT"
-            )
-
-            st.markdown("### 今次發佈摘要")
-
-            first, second, third, fourth, fifth = (
-                st.columns(5)
-            )
+            first, second, third = st.columns(3)
 
             first.metric(
-                "已選正式推薦",
-                official_count,
+                "全部命中最低概率",
+                format_probability(
+                    recommendation_set
+                    .get(
+                        "all_hit_probability",
+                        {},
+                    )
+                    .get("minimum")
+                ),
             )
 
             second.metric(
-                "已選進取選擇",
-                alternative_count,
+                "最少一項命中最低概率",
+                format_probability(
+                    recommendation_set
+                    .get(
+                        "at_least_one_hit_probability",
+                        {},
+                    )
+                    .get("minimum")
+                ),
             )
 
             third.metric(
-                "已選波膽",
-                score_count,
+                "全部不命中最高概率",
+                format_probability(
+                    recommendation_set
+                    .get(
+                        "all_miss_probability",
+                        {},
+                    )
+                    .get("maximum")
+                ),
             )
 
-            fourth.metric(
-                "已選 FT",
-                ft_count,
-            )
-
-            fifth.metric(
-                "已選 HT",
-                ht_count,
-            )
-
-            if not selected_recommendations:
-                st.warning(
-                    "尚未選擇任何發佈項目。"
-                    "請勾選最少一項推薦。"
+            st.info(
+                "組合分析狀態："
+                + status_chinese(
+                    recommendation_set.get(
+                        "status",
+                        "NOT_AVAILABLE",
+                    )
                 )
+            )
 
-            else:
-                preview_rows = []
-
-                for record in selected_recommendations:
-                    preview_rows.append({
-                        "類別": tier_names.get(
-                            record.get("tier"),
-                            record.get("tier"),
-                        ),
-                        "時段": period_names.get(
-                            record.get("period"),
-                            record.get("period"),
-                        ),
-                        "推薦": record.get(
-                            "rec_title"
-                        ),
-                        "市場": record.get(
-                            "market"
-                        ),
-                        "Scope": record.get(
-                            "market_scope"
-                        ),
-                        "選擇": record.get(
-                            "selection"
-                        ),
-                        "盤口": record.get(
-                            "line"
-                        ),
-                        "賠率": record.get(
-                            "odds"
-                        ),
-                        "保守命中率": (
-                            format_probability(
-                                record.get(
-                                    "conservative_hit"
-                                )
-                            )
-                        ),
-                        "Edge": record.get(
-                            "edge"
-                        ),
-                        "EV": record.get(
-                            "expected_value"
-                        ),
-                    })
-
-                st.dataframe(
-                    pd.DataFrame(preview_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            with st.expander(
-                "檢查今次實際提交的 Portal payload",
-                expanded=False,
+            if recommendation_set.get(
+                "pair_compatibility"
             ):
-                st.json(selected_bundle)
+                st.json(
+                    recommendation_set[
+                        "pair_compatibility"
+                    ]
+                )
 
-            st.download_button(
-                "⬇️ 下載今次選定的 Portal payload",
-                data=json_text(selected_bundle),
-                file_name=download_name(
-                    "aegis_selected_portal_bundle"
-                ),
-                mime="application/json",
-                use_container_width=True,
-                disabled=not bool(
-                    selected_recommendations
-                ),
+        elif result_section == "波膽參考":
+            st.subheader("🎯 高風險波膽參考")
+
+            correct_scores = result.get(
+                "correct_scores",
+                {},
             )
 
-            publish_clicked = st.button(
-                (
-                    "📤 發佈已選擇的 "
-                    f"{len(selected_recommendations)} 項"
-                ),
-                type="primary",
-                use_container_width=True,
-                key="portal_publish_button",
-                disabled=not bool(
-                    selected_recommendations
-                ),
+            st.warning(
+                correct_scores.get(
+                    "warning",
+                    "波膽屬高風險及低命中率市場。",
+                )
             )
 
-            if publish_clicked:
-                try:
-                    if not configured_api_token():
-                        raise ValueError(
-                            "無法讀取 Streamlit secret："
-                            "portal_api.token"
-                        )
+            score_records = correct_scores.get(
+                "recommendations",
+                [],
+            )
 
-                    if not selected_recommendations:
-                        raise ValueError(
-                            "請先選擇最少一項推薦。"
-                        )
+            if score_records:
+                score_columns = st.columns(
+                    len(score_records)
+                )
 
-                    with st.spinner(
-                        "正在發佈已選擇的推薦……"
-                    ):
-                        response = portal_request(
-                            selected_bundle
-                        )
-
-                    st.session_state[
-                        "portal_last_response"
-                    ] = response
-
-                    st.success(
-                        "已成功發佈 "
-                        f"{len(selected_recommendations)} "
-                        "項到 VIP Match Centre。"
+                for column, score in zip(
+                    score_columns,
+                    score_records,
+                ):
+                    probability = score.get(
+                        "probability",
+                        {},
                     )
 
-                    first, second, third = st.columns(3)
+                    with column:
+                        st.markdown(
+                            f"""
+                            <div class="score-card">
+                                <div class="score-value">
+                                    {html_escape(score.get("score", "—"))}
+                                </div>
+                                <div class="score-probability">
+                                    保守概率
+                                    {format_probability(
+                                        probability.get("minimum"),
+                                        2
+                                    )}
+                                </div>
+                                <div style="
+                                    color: rgba(255,255,255,0.52);
+                                    margin-top: 0.4rem;
+                                    font-size: 0.82rem;
+                                ">
+                                    中位
+                                    {format_probability(
+                                        probability.get("median"),
+                                        2
+                                    )}
+                                    · 公平賠率
+                                    {format_odds(
+                                        score.get("central_fair_odds"),
+                                        2
+                                    )}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.info("沒有波膽參考。")
+
+        elif result_section == "模型診斷":
+            st.subheader("模型診斷")
+
+            st.caption(
+                "基本模型摘要會立即顯示。"
+                "大型情境資料表只會在你明確啟用後載入。"
+            )
+
+            show_full_scenario_tables = st.checkbox(
+                "載入完整模型情境資料表",
+                value=False,
+                key="ultra_show_full_scenario_tables",
+                help=(
+                    "完整情境資料可能很大。"
+                    "只有需要檢查每個模型情境時才啟用。"
+                ),
+            )
+
+            model = result.get(
+                "model",
+                {},
+            )
+
+            periods = model.get(
+                "periods",
+                {},
+            )
+
+            if periods:
+                for period, section in sorted(
+                    periods.items(),
+                    key=lambda item: PERIOD_ORDER.get(
+                        normalize_period(
+                            item[0]
+                        ),
+                        9,
+                    ),
+                ):
+                    period_name = (
+                        "全場 FT"
+                        if period == "FT"
+                        else (
+                            "半場 HT"
+                            if period == "HT"
+                            else period
+                        )
+                    )
+
+                    st.markdown(
+                        f"### {period_name}"
+                    )
+
+                    first, second, third, fourth = st.columns(4)
 
                     first.metric(
-                        "Match",
-                        response.get(
-                            "match_action",
+                        "每隊最高入球",
+                        section.get(
+                            "max_goals_per_team",
                             "—",
                         ),
                     )
 
                     second.metric(
-                        "Recommendations",
-                        response.get(
-                            "recommendation_count",
-                            len(
-                                selected_recommendations
-                            ),
+                        "狀態數",
+                        section.get(
+                            "state_count",
+                            "—",
                         ),
                     )
 
                     third.metric(
-                        "Removed old rows",
-                        response.get(
-                            "removed_recommendations",
-                            0,
+                        "完整情境數",
+                        section.get(
+                            "full_scenario_count",
+                            "—",
                         ),
                     )
 
-                    st.json(response)
-
-                except Exception as publish_error:
-                    st.error(
-                        f"發佈失敗：{publish_error}"
+                    fourth.metric(
+                        "網格完整",
+                        (
+                            "是"
+                            if section.get(
+                                "grid_complete"
+                            )
+                            else "否"
+                        ),
                     )
 
-                    with st.expander(
-                        "發佈錯誤詳情",
-                        expanded=False,
+                    full_scenarios = section.get(
+                        "full_scenarios",
+                        [],
+                    )
+
+                    if (
+                        full_scenarios
+                        and show_full_scenario_tables
                     ):
-                        st.code(
-                            traceback.format_exc(),
-                            language="text",
+                        st.dataframe(
+                            pd.DataFrame(
+                                full_scenarios
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
                         )
 
-        except Exception as bundle_error:
-            st.error(
-                "無法建立 Portal payload："
-                f"{bundle_error}"
-            )
+                    elif full_scenarios:
+                        st.caption(
+                            "完整情境資料表尚未載入。"
+                            f"此時段共有 {len(full_scenarios)} 個情境。"
+                        )
+
+                    errors = section.get(
+                        "full_scenario_errors",
+                        [],
+                    )
+
+                    if errors:
+                        st.warning(
+                            f"{period_name} 有 "
+                            f"{len(errors)} 個情境失敗。"
+                        )
+
+                        st.json(errors)
+
+                    st.divider()
 
             with st.expander(
-                "Payload 錯誤詳情",
+                "半場－全場一致性詳情",
                 expanded=False,
             ):
-                st.code(
-                    traceback.format_exc(),
-                    language="text",
+                st.json(
+                    result.get(
+                        "ht_ft_coherence",
+                        {},
+                    )
                 )
 
-    elif result_section == "完整 JSON":
-        st.subheader("完整引擎輸出")
+            with st.expander(
+                "方法說明",
+                expanded=False,
+            ):
+                st.json(
+                    result.get(
+                        "methodology",
+                        {},
+                    )
+                )
 
-        result_json = json_text(result)
-
-        input_json = json_text(
-            st.session_state.ultra_input
-            or {}
-        )
-
-        first, second = st.columns(2)
-
-        first.download_button(
-            "⬇️ 下載完整分析結果",
-            data=result_json,
-            file_name=download_name(
-                "aegis_ultra_result"
-            ),
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        second.download_button(
-            "⬇️ 下載完整分析輸入",
-            data=input_json,
-            file_name=download_name(
-                "aegis_ultra_input"
-            ),
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        show_complete_json = st.checkbox(
-            "在頁面顯示完整 JSON",
-            value=False,
-            key="ultra_show_complete_json",
-            help=(
-                "完整 JSON 可能非常大。"
-                "下載 JSON 不需要啟用這個選項。"
-            ),
-        )
-
-        if show_complete_json:
-            st.json(result)
-        else:
-            st.info(
-                "完整 JSON 尚未在頁面展開。"
-                "你仍可使用上方按鈕直接下載。"
+        elif result_section == "發佈到 VIP App":
+            st.subheader(
+                "📤 發佈到 VIP Match Centre"
             )
 
-else:
-    st.info(
-        "選擇輸入模式，貼上整批賠率，然後開始分析。"
-    )
+            st.markdown(
+                """
+                <div class="publish-panel">
+                    發佈資料會完全配合 Aegis V2 Portal API：
+                    <b>period、market_scope、edge、
+                    expected_value、conflict_ids</b>
+                    都會輸出到 recommendations 工作表。
+                    缺少 period 的候選盤會直接報錯，
+                    不會任意當成 FT。
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
+            first, second = st.columns(2)
+
+            with first:
+                publish_alternatives = st.checkbox(
+                    "同時發佈非正式候選盤為進取選擇",
+                    value=True,
+                    key="portal_publish_alternatives",
+                )
+
+                publish_correct_scores = st.checkbox(
+                    "發佈波膽參考",
+                    value=True,
+                    key="portal_publish_scores",
+                )
+
+            with second:
+                publish_status = st.selectbox(
+                    "發佈狀態",
+                    options=[
+                        "published",
+                        "draft",
+                    ],
+                    index=0,
+                    key="portal_publish_status",
+                )
+
+                match_id_override = st.text_input(
+                    "自訂 match_id",
+                    placeholder=(
+                        "留空時使用穩定雜湊 ID"
+                    ),
+                    key="portal_match_id_override",
+                )
+
+            portal_input_snapshot = (
+                st.session_state.ultra_input
+                or {}
+            )
+
+            publisher_match_id = stable_match_id(
+                result,
+                portal_input_snapshot,
+            )
+
+            publisher_state_suffix = (
+                hashlib.sha256(
+                    publisher_match_id.encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:12]
+            )
+
+            st.markdown("### VIP App 投注方向")
+
+            manual_model_direction = st.text_area(
+                "人手設定投注方向",
+                value="",
+                placeholder=(
+                    "例如：主隊不敗方向；"
+                    "全場入球細為主要部署。"
+                ),
+                height=110,
+                key=(
+                    "portal_manual_model_direction_"
+                    f"{publisher_state_suffix}"
+                ),
+                help=(
+                    "只有這裡輸入的內容會顯示在 VIP App。"
+                    "留空時，VIP App 不會顯示投注方向。"
+                ),
+            )
+
+            st.caption(
+                "引擎原本產生的投注方向不會自動發佈。"
+                "請按照最後的人手決定輸入，亦可以留空。"
+            )
+
+            try:
+                portal_bundle = build_portal_bundle(
+                    result=result,
+                    input_snapshot=(
+                        portal_input_snapshot
+                    ),
+                    publish_alternatives=(
+                        publish_alternatives
+                    ),
+                    publish_correct_scores=(
+                        publish_correct_scores
+                    ),
+                    publish_status=publish_status,
+                    match_id_override=(
+                        match_id_override
+                    ),
+                    model_direction_override=(
+                        manual_model_direction
+                    ),
+                )
+
+                bundle_recommendations = portal_bundle[
+                    "recommendations"
+                ]
+
+                # ------------------------------------------------
+                # Individual recommendation editing and selection
+                # ------------------------------------------------
+
+                st.markdown("### 選擇及編輯今次發佈項目")
+
+                st.caption(
+                    "你可以把候選盤設定為正式推薦或進取選擇，"
+                    "並在人手發佈前加入或修改雨姐短評。"
+                    "只有已勾選的項目會提交。"
+                )
+
+                select_all_column, clear_column = st.columns(2)
+
+                with select_all_column:
+                    if st.button(
+                        "✅ 全選",
+                        use_container_width=True,
+                        key="portal_select_all",
+                    ):
+                        for record in bundle_recommendations:
+                            rec_id = record["rec_id"]
+
+                            st.session_state[
+                                f"portal_publish_pick_{rec_id}"
+                            ] = True
+
+                        rerun_results_fragment()
+
+                with clear_column:
+                    if st.button(
+                        "⬜ 全部取消",
+                        use_container_width=True,
+                        key="portal_clear_all",
+                    ):
+                        for record in bundle_recommendations:
+                            rec_id = record["rec_id"]
+
+                            st.session_state[
+                                f"portal_publish_pick_{rec_id}"
+                            ] = False
+
+                        rerun_results_fragment()
+
+                selected_rec_ids = set()
+
+                edited_bundle_recommendations: List[
+                    Dict[str, Any]
+                ] = []
+
+                tier_names = {
+                    "OFFICIAL": "✅ 正式推薦",
+                    "ALTERNATIVE": "⚡ 進取選擇",
+                    "CORRECT_SCORE": "🎯 波膽參考",
+                }
+
+                period_names = {
+                    "FT": "FT 全場",
+                    "HT": "HT 半場",
+                    "2H": "2H 下半場",
+                }
+
+                editable_tier_options = [
+                    "OFFICIAL",
+                    "ALTERNATIVE",
+                ]
+
+                for record in bundle_recommendations:
+                    rec_id = record["rec_id"]
+
+                    editable_record = deepcopy(
+                        record
+                    )
+
+                    selection_widget_key = (
+                        f"portal_publish_pick_{rec_id}"
+                    )
+
+                    tier_widget_key = (
+                        f"portal_publish_tier_{rec_id}"
+                    )
+
+                    commentary_widget_key = (
+                        "portal_publish_commentary_"
+                        f"{rec_id}"
+                    )
+
+                    if (
+                        selection_widget_key
+                        not in st.session_state
+                    ):
+                        # Nothing is selected automatically.
+                        # This prevents accidental publication.
+                        st.session_state[
+                            selection_widget_key
+                        ] = False
+
+                    original_tier = optional_text(
+                        record.get("tier")
+                    ) or "ALTERNATIVE"
+
+                    with st.container(border=True):
+                        checkbox_column, detail_column = (
+                            st.columns([0.08, 0.92])
+                        )
+
+                        with checkbox_column:
+                            selected = st.checkbox(
+                                "選擇",
+                                key=selection_widget_key,
+                                label_visibility="collapsed",
+                            )
+
+                        with detail_column:
+                            period = normalize_period(
+                                record.get("period")
+                            )
+
+                            if (
+                                original_tier
+                                == "CORRECT_SCORE"
+                            ):
+                                edited_tier = (
+                                    "CORRECT_SCORE"
+                                )
+
+                                st.markdown(
+                                    "**🎯 波膽參考｜"
+                                    + period_names.get(
+                                        period,
+                                        period,
+                                    )
+                                    + "｜"
+                                    + html_escape(
+                                        record.get(
+                                            "rec_title",
+                                            "未命名選擇",
+                                        )
+                                    )
+                                    + "**"
+                                )
+
+                                st.caption(
+                                    "波膽項目會保留為波膽參考。"
+                                )
+
+                            else:
+                                default_tier = (
+                                    original_tier
+                                    if original_tier
+                                    in editable_tier_options
+                                    else "ALTERNATIVE"
+                                )
+
+                                if (
+                                    tier_widget_key
+                                    not in st.session_state
+                                ):
+                                    st.session_state[
+                                        tier_widget_key
+                                    ] = default_tier
+
+                                edited_tier = st.selectbox(
+                                    "發佈類別",
+                                    options=(
+                                        editable_tier_options
+                                    ),
+                                    format_func=(
+                                        lambda value: (
+                                            tier_names.get(
+                                                value,
+                                                value,
+                                            )
+                                        )
+                                    ),
+                                    key=tier_widget_key,
+                                )
+
+                                st.markdown(
+                                    "**"
+                                    + tier_names.get(
+                                        edited_tier,
+                                        edited_tier,
+                                    )
+                                    + "｜"
+                                    + period_names.get(
+                                        period,
+                                        period,
+                                    )
+                                    + "｜"
+                                    + html_escape(
+                                        record.get(
+                                            "rec_title",
+                                            "未命名選擇",
+                                        )
+                                    )
+                                    + "**"
+                                )
+
+                            detail_parts = [
+                                (
+                                    "市場："
+                                    + optional_text(
+                                        record.get("market")
+                                    )
+                                ),
+                                (
+                                    "選擇："
+                                    + optional_text(
+                                        record.get(
+                                            "selection"
+                                        )
+                                    )
+                                ),
+                            ]
+
+                            line = record.get("line")
+
+                            if (
+                                line is not None
+                                and optional_text(line)
+                            ):
+                                detail_parts.append(
+                                    "盤口："
+                                    + optional_text(line)
+                                )
+
+                            odds = safe_float(
+                                record.get("odds")
+                            )
+
+                            if odds is not None:
+                                detail_parts.append(
+                                    "賠率："
+                                    + format_odds(
+                                        odds,
+                                        3,
+                                    )
+                                )
+
+                            hit = record.get(
+                                "conservative_hit"
+                            )
+
+                            if safe_float(hit) is not None:
+                                detail_parts.append(
+                                    "保守命中："
+                                    + format_probability(
+                                        hit
+                                    )
+                                )
+
+                            st.caption(
+                                " ｜ ".join(detail_parts)
+                            )
+
+                            manual_commentary = (
+                                st.text_area(
+                                    "人手短評",
+                                    value=optional_text(
+                                        record.get(
+                                            "commentary"
+                                        )
+                                    ),
+                                    placeholder=(
+                                        "輸入要顯示在 VIP App "
+                                        "的雨姐短評；"
+                                        "可修改或清除原有內容。"
+                                    ),
+                                    height=95,
+                                    key=(
+                                        commentary_widget_key
+                                    ),
+                                )
+                            )
+
+                    editable_record["tier"] = (
+                        edited_tier
+                    )
+
+                    editable_record["commentary"] = (
+                        optional_text(
+                            manual_commentary
+                        )
+                    )
+
+                    edited_bundle_recommendations.append(
+                        editable_record
+                    )
+
+                    if selected:
+                        selected_rec_ids.add(
+                            rec_id
+                        )
+
+                selected_recommendations = [
+                    deepcopy(record)
+                    for record
+                    in edited_bundle_recommendations
+                    if record.get("rec_id")
+                    in selected_rec_ids
+                ]
+
+                # Rebuild the rank within each manually selected
+                # category so promoted or demoted recommendations
+                # appear in a clean and predictable order.
+                tier_rank_counters = {
+                    "OFFICIAL": 1,
+                    "ALTERNATIVE": 1,
+                    "CORRECT_SCORE": 1,
+                }
+
+                for record in selected_recommendations:
+                    tier = optional_text(
+                        record.get("tier")
+                    ) or "ALTERNATIVE"
+
+                    record["rank"] = (
+                        tier_rank_counters.get(
+                            tier,
+                            1,
+                        )
+                    )
+
+                    tier_rank_counters[tier] = (
+                        record["rank"] + 1
+                    )
+
+                # Remove conflict references pointing to records
+                # that are not included in this publication.
+                selected_id_set = {
+                    optional_text(
+                        record.get("rec_id")
+                    )
+                    for record
+                    in selected_recommendations
+                    if optional_text(
+                        record.get("rec_id")
+                    )
+                }
+
+                for record in selected_recommendations:
+                    existing_conflicts = [
+                        value.strip()
+                        for value in optional_text(
+                            record.get(
+                                "conflict_ids"
+                            )
+                        ).split(",")
+                        if value.strip()
+                    ]
+
+                    record["conflict_ids"] = ",".join(
+                        conflict_id
+                        for conflict_id
+                        in existing_conflicts
+                        if (
+                            conflict_id
+                            in selected_id_set
+                            and conflict_id
+                            != record.get("rec_id")
+                        )
+                    )
+
+                # Only selected records are submitted.
+                selected_bundle = deepcopy(
+                    portal_bundle
+                )
+
+                selected_bundle[
+                    "recommendations"
+                ] = selected_recommendations
+
+                # This means the selected list becomes the complete
+                # published recommendation set for this match.
+                selected_bundle[
+                    "replace_recommendations"
+                ] = True
+
+                official_count = sum(
+                    1
+                    for record in selected_recommendations
+                    if record.get("tier") == "OFFICIAL"
+                )
+
+                alternative_count = sum(
+                    1
+                    for record in selected_recommendations
+                    if record.get("tier") == "ALTERNATIVE"
+                )
+
+                score_count = sum(
+                    1
+                    for record in selected_recommendations
+                    if record.get("tier") == "CORRECT_SCORE"
+                )
+
+                ft_count = sum(
+                    1
+                    for record in selected_recommendations
+                    if record.get("period") == "FT"
+                )
+
+                ht_count = sum(
+                    1
+                    for record in selected_recommendations
+                    if record.get("period") == "HT"
+                )
+
+                st.markdown("### 今次發佈摘要")
+
+                first, second, third, fourth, fifth = (
+                    st.columns(5)
+                )
+
+                first.metric(
+                    "已選正式推薦",
+                    official_count,
+                )
+
+                second.metric(
+                    "已選進取選擇",
+                    alternative_count,
+                )
+
+                third.metric(
+                    "已選波膽",
+                    score_count,
+                )
+
+                fourth.metric(
+                    "已選 FT",
+                    ft_count,
+                )
+
+                fifth.metric(
+                    "已選 HT",
+                    ht_count,
+                )
+
+                if not selected_recommendations:
+                    st.warning(
+                        "尚未選擇任何發佈項目。"
+                        "請勾選最少一項推薦。"
+                    )
+
+                else:
+                    preview_rows = []
+
+                    for record in selected_recommendations:
+                        preview_rows.append({
+                            "類別": tier_names.get(
+                                record.get("tier"),
+                                record.get("tier"),
+                            ),
+                            "時段": period_names.get(
+                                record.get("period"),
+                                record.get("period"),
+                            ),
+                            "推薦": record.get(
+                                "rec_title"
+                            ),
+                            "市場": record.get(
+                                "market"
+                            ),
+                            "Scope": record.get(
+                                "market_scope"
+                            ),
+                            "選擇": record.get(
+                                "selection"
+                            ),
+                            "盤口": record.get(
+                                "line"
+                            ),
+                            "賠率": record.get(
+                                "odds"
+                            ),
+                            "保守命中率": (
+                                format_probability(
+                                    record.get(
+                                        "conservative_hit"
+                                    )
+                                )
+                            ),
+                            "Edge": record.get(
+                                "edge"
+                            ),
+                            "EV": record.get(
+                                "expected_value"
+                            ),
+                        })
+
+                    st.dataframe(
+                        pd.DataFrame(preview_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                with st.expander(
+                    "檢查今次實際提交的 Portal payload",
+                    expanded=False,
+                ):
+                    st.json(selected_bundle)
+
+                st.download_button(
+                    "⬇️ 下載今次選定的 Portal payload",
+                    data=json_text(selected_bundle),
+                    file_name=download_name(
+                        "aegis_selected_portal_bundle"
+                    ),
+                    mime="application/json",
+                    use_container_width=True,
+                    disabled=not bool(
+                        selected_recommendations
+                    ),
+                )
+
+                publish_clicked = st.button(
+                    (
+                        "📤 發佈已選擇的 "
+                        f"{len(selected_recommendations)} 項"
+                    ),
+                    type="primary",
+                    use_container_width=True,
+                    key="portal_publish_button",
+                    disabled=not bool(
+                        selected_recommendations
+                    ),
+                )
+
+                if publish_clicked:
+                    try:
+                        if not configured_api_token():
+                            raise ValueError(
+                                "無法讀取 Streamlit secret："
+                                "portal_api.token"
+                            )
+
+                        if not selected_recommendations:
+                            raise ValueError(
+                                "請先選擇最少一項推薦。"
+                            )
+
+                        with st.spinner(
+                            "正在發佈已選擇的推薦……"
+                        ):
+                            response = portal_request(
+                                selected_bundle
+                            )
+
+                        st.session_state[
+                            "portal_last_response"
+                        ] = response
+
+                        st.success(
+                            "已成功發佈 "
+                            f"{len(selected_recommendations)} "
+                            "項到 VIP Match Centre。"
+                        )
+
+                        first, second, third = st.columns(3)
+
+                        first.metric(
+                            "Match",
+                            response.get(
+                                "match_action",
+                                "—",
+                            ),
+                        )
+
+                        second.metric(
+                            "Recommendations",
+                            response.get(
+                                "recommendation_count",
+                                len(
+                                    selected_recommendations
+                                ),
+                            ),
+                        )
+
+                        third.metric(
+                            "Removed old rows",
+                            response.get(
+                                "removed_recommendations",
+                                0,
+                            ),
+                        )
+
+                        st.json(response)
+
+                    except Exception as publish_error:
+                        st.error(
+                            f"發佈失敗：{publish_error}"
+                        )
+
+                        with st.expander(
+                            "發佈錯誤詳情",
+                            expanded=False,
+                        ):
+                            st.code(
+                                traceback.format_exc(),
+                                language="text",
+                            )
+
+            except Exception as bundle_error:
+                st.error(
+                    "無法建立 Portal payload："
+                    f"{bundle_error}"
+                )
+
+                with st.expander(
+                    "Payload 錯誤詳情",
+                    expanded=False,
+                ):
+                    st.code(
+                        traceback.format_exc(),
+                        language="text",
+                    )
+
+        elif result_section == "完整 JSON":
+            st.subheader("完整引擎輸出")
+
+            result_json = json_text(result)
+
+            input_json = json_text(
+                st.session_state.ultra_input
+                or {}
+            )
+
+            first, second = st.columns(2)
+
+            first.download_button(
+                "⬇️ 下載完整分析結果",
+                data=result_json,
+                file_name=download_name(
+                    "aegis_ultra_result"
+                ),
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            second.download_button(
+                "⬇️ 下載完整分析輸入",
+                data=input_json,
+                file_name=download_name(
+                    "aegis_ultra_input"
+                ),
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            show_complete_json = st.checkbox(
+                "在頁面顯示完整 JSON",
+                value=False,
+                key="ultra_show_complete_json",
+                help=(
+                    "完整 JSON 可能非常大。"
+                    "下載 JSON 不需要啟用這個選項。"
+                ),
+            )
+
+            if show_complete_json:
+                st.json(result)
+            else:
+                st.info(
+                    "完整 JSON 尚未在頁面展開。"
+                    "你仍可使用上方按鈕直接下載。"
+                )
+
+    else:
+        st.info(
+            "選擇輸入模式，貼上整批賠率，然後開始分析。"
+        )
+
+
+render_results_fragment()
 
 # ============================================================
 # 18. Footer
@@ -5767,6 +6006,3 @@ st.caption(
     "AEGIS ULTRA 只提供市場重建、概率分析及風險參考，"
     "不保證任何投注結果。"
 )
-
-
-

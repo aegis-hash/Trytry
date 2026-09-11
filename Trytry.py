@@ -3195,9 +3195,6 @@ def build_portal_bundle(
             )
         ),
         "status": publish_status,
-        # Never automatically publish the engine's original
-        # betting direction. The publisher must enter the
-        # final direction manually, or leave it blank.
         "model_direction": optional_text(
             model_direction_override
         ),
@@ -4188,530 +4185,364 @@ if input_mode == "🎛️ 批量貼上":
                 "sharp_books": sharp_books,
                 "hkjc_markets": hkjc_markets,
                 "settings": {
-                    "primary_source": primary_source,
-                    "minimum_odds": float(
-                        minimum_odds
-                    ),
-                    "maximum_odds": (
-                        float(maximum_odds)
-                        if maximum_odds
-                        is not None
-                        else None
-                    ),
-                    "max_recommendations": int(
-                        maximum_recommendations
+                    "minimum_odds": minimum_odds,
+                    "maximum_odds": maximum_odds,
+                    "max_recommendations": safe_int(
+                        maximum_recommendations,
+                        3,
                     ),
                     "minimum_official_hit_probability": (
-                        float(
-                            minimum_hit_probability_pct
-                        )
-                        / 100.0
+                        minimum_hit_probability_pct / 100.0
                     ),
-                    "correct_score_count": int(
-                        correct_score_count
+                    "correct_score_count": safe_int(
+                        correct_score_count,
+                        2,
                     ),
-                    "devig_methods": list(
-                        devig_methods
-                    ),
+                    "devig_methods": devig_methods,
+                    "primary_source": primary_source,
                     "ev_rejection_floor": (
-                        float(ev_floor_pct)
-                        / 100.0
+                        (ev_floor_pct / 100.0)
                         if use_ev_floor
                         else None
                     ),
                     "features": {
-                        "quality_gate": bool(
-                            quality_gate
-                        ),
-                        "stress_audit": bool(
-                            stress_audit
-                        ),
-                        "family_out_audit": bool(
-                            family_out_audit
-                        ),
-                        "adaptive_grids": bool(
-                            adaptive_grids
-                        ),
-                        "ht_ft_coherence": bool(
-                            ht_ft_coherence
-                        ),
+                        "quality_gate": quality_gate,
+                        "stress_audit": stress_audit,
+                        "family_out_audit": family_out_audit,
+                        "adaptive_grids": adaptive_grids,
+                        "ht_ft_coherence": ht_ft_coherence,
                     },
                 },
             }
-
-            input_preview = deepcopy(
-                input_to_run
-            )
-
-        except Exception as input_error:
-            st.session_state.ultra_error = str(
-                input_error
-            )
-
-            st.session_state.ultra_traceback = (
-                traceback.format_exc()
-            )
-
-            st.error(
-                f"輸入錯誤：{input_error}"
-            )
-
+        except Exception as err:
+            st.error(f"輸入格式錯誤：{err}")
+            st.session_state.ultra_error = str(err)
+            st.session_state.ultra_traceback = traceback.format_exc()
 
 elif input_mode == "📋 貼上 JSON":
     st.markdown(
-        '<div class="section-label">Direct JSON input</div>',
+        '<div class="section-label">JSON String Input</div>',
         unsafe_allow_html=True,
     )
-
-    st.markdown(
-        """
-        <div class="info-panel">
-            直接貼上完整 AEGIS ULTRA V2 輸入 JSON。
-            period 必須明確保留於每個 HKJC 候選盤。
-        </div>
-        """,
-        unsafe_allow_html=True,
+    json_str = st.text_area(
+        "貼上 JSON 設定資料",
+        value=st.session_state.get(
+            "ultra_json_text",
+            json_text(example_json_input()),
+        ),
+        height=400,
+        key="ultra_json_area",
     )
 
-    json_input_value = st.text_area(
-        "AEGIS ULTRA 輸入 JSON",
-        key="ultra_json_text",
-        height=650,
-    )
-
-    run_json = st.button(
-        "🚀 執行貼上的 JSON",
+    if st.button(
+        "🚀 執行 JSON 分析",
         type="primary",
         use_container_width=True,
         key="ultra_json_run",
-    )
-
-    if run_json:
+    ):
         try:
-            parsed_json = json.loads(
-                json_input_value
-            )
+            parsed_data = json.loads(json_str)
+            if not isinstance(parsed_data, dict):
+                raise ValueError("JSON 頂層必須是物件 (dict)。")
+            input_to_run = parsed_data
+            st.session_state.ultra_json_text = json_str
+        except Exception as err:
+            st.error(f"JSON 解析錯誤：{err}")
+            st.session_state.ultra_error = str(err)
+            st.session_state.ultra_traceback = traceback.format_exc()
 
-            if not isinstance(
-                parsed_json,
-                dict,
-            ):
-                raise ValueError(
-                    "JSON 最外層必須是物件。"
-                )
-
-            input_to_run = parsed_json
-            input_preview = deepcopy(
-                parsed_json
-            )
-
-        except Exception as json_error:
-            st.session_state.ultra_error = str(
-                json_error
-            )
-
-            st.session_state.ultra_traceback = (
-                traceback.format_exc()
-            )
-
-            st.error(
-                f"JSON 錯誤：{json_error}"
-            )
-
-
-else:
+elif input_mode == "📁 上載 JSON":
     st.markdown(
-        '<div class="section-label">JSON file input</div>',
+        '<div class="section-label">JSON File Upload</div>',
         unsafe_allow_html=True,
     )
-
     uploaded_file = st.file_uploader(
-        "上載 AEGIS ULTRA JSON",
+        "選擇 JSON 檔案",
         type=["json"],
+        key="ultra_file_uploader",
     )
-
-    uploaded_preview = None
 
     if uploaded_file is not None:
         try:
-            uploaded_text = (
-                uploaded_file
-                .getvalue()
-                .decode("utf-8-sig")
-            )
+            file_contents = uploaded_file.read().decode("utf-8")
+            parsed_data = json.loads(file_contents)
+            st.json(parsed_data, expanded=False)
 
-            uploaded_preview = json.loads(
-                uploaded_text
-            )
-
-            st.success(
-                f"已讀取：{uploaded_file.name}"
-            )
-
-            with st.expander(
-                "檢查上載內容",
-                expanded=False,
+            if st.button(
+                "🚀 執行上載 JSON 分析",
+                type="primary",
+                use_container_width=True,
+                key="ultra_upload_run",
             ):
-                st.json(uploaded_preview)
-
-        except Exception as preview_error:
-            uploaded_preview = None
-
-            st.error(
-                f"無法讀取 JSON：{preview_error}"
-            )
-
-    run_uploaded = st.button(
-        "🚀 執行上載的 JSON",
-        type="primary",
-        use_container_width=True,
-        key="ultra_upload_run",
-    )
-
-    if run_uploaded:
-        try:
-            if uploaded_preview is None:
-                raise ValueError(
-                    "請先上載有效的 JSON 檔案。"
-                )
-
-            if not isinstance(
-                uploaded_preview,
-                dict,
-            ):
-                raise ValueError(
-                    "JSON 最外層必須是物件。"
-                )
-
-            input_to_run = uploaded_preview
-            input_preview = deepcopy(
-                uploaded_preview
-            )
-
-        except Exception as upload_error:
-            st.session_state.ultra_error = str(
-                upload_error
-            )
-
-            st.session_state.ultra_traceback = (
-                traceback.format_exc()
-            )
-
-            st.error(
-                f"JSON 錯誤：{upload_error}"
-            )
+                input_to_run = parsed_data
+                st.session_state.ultra_json_text = file_contents
+        except Exception as err:
+            st.error(f"檔案讀取或 JSON 解析錯誤：{err}")
+            st.session_state.ultra_error = str(err)
+            st.session_state.ultra_traceback = traceback.format_exc()
 
 
 # ============================================================
-# 16. Execute engine
+# 16. Engine execution
 # ============================================================
-
-if input_preview is not None:
-    with st.expander(
-        "檢查提交給引擎的完整資料",
-        expanded=False,
-    ):
-        st.json(input_preview)
-
-    st.download_button(
-        "⬇️ 下載本次輸入 JSON",
-        data=json_text(input_preview),
-        file_name=download_name(
-            "aegis_ultra_input"
-        ),
-        mime="application/json",
-        use_container_width=True,
-    )
-
 
 if input_to_run is not None:
-    st.session_state.ultra_error = None
-    st.session_state.ultra_traceback = None
-
     try:
-        with st.spinner(
-            "正在重建 FT／HT 尖銳市場、"
-            "執行 target-line-out、壓力測試、"
-            "HT–FT 一致性及推薦衝突檢查……"
-        ):
-            execute_engine(input_to_run)
-            st.success("AEGIS ULTRA 分析完成！")
-    except Exception as exec_error:
-        st.session_state.ultra_error = str(exec_error)
+        with st.spinner("⚡ AEGIS ULTRA 正在進行多市場對沖與風險概率計算..."):
+            result_data = execute_engine(input_to_run)
+            st.session_state.ultra_error = None
+            st.session_state.ultra_traceback = None
+            st.success("分析完成！")
+            st.rerun()
+    except Exception as err:
+        st.session_state.ultra_error = str(err)
         st.session_state.ultra_traceback = traceback.format_exc()
-        st.error(f"引擎執行錯誤：{exec_error}")
+        st.error(f"引擎執行失敗：{err}")
+
+if st.session_state.get("ultra_error"):
+    with st.expander("查看詳細錯誤追蹤 (Error Traceback)", expanded=False):
+        st.code(st.session_state.ultra_traceback or st.session_state.ultra_error)
 
 
 # ============================================================
-# 17. Results Display & Portal Publisher
+# 17. Results dashboard & manual management interface
 # ============================================================
 
-if st.session_state.ultra_error:
-    st.error(f"分析時發生錯誤：{st.session_state.ultra_error}")
-    with st.expander("查看錯誤 Call Stack", expanded=True):
-        st.code(st.session_state.ultra_traceback)
+current_result = st.session_state.get("ultra_result")
+current_input = st.session_state.get("ultra_input") or {}
 
-result = st.session_state.get("ultra_result")
-input_snapshot = st.session_state.get("ultra_input") or {}
-
-if result:
+if current_result:
     st.divider()
-    st.markdown(
-        '<div class="section-label">Analysis Results</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown("## 📊 分析結果與管理中心")
 
-    match_info = result.get("match", {})
-    home_team = match_info.get("home", "主隊")
-    away_team = match_info.get("away", "客隊")
-    match_display = match_info.get("name", f"{home_team} vs {away_team}")
+    rec_list = current_result.get("recommendations", [])
+    cand_list = current_result.get("candidate_markets", [])
+    quality_info = current_result.get("model_quality", {})
+    coherence_info = current_result.get("ht_ft_coherence", {})
 
-    recs = result.get("recommendations", [])
-    candidates = result.get("candidate_markets", [])
-    quality_info = result.get("model_quality", {})
-    coherence_info = result.get("ht_ft_coherence", {})
-
-    quality_status = quality_info.get("status", "N/A") if isinstance(quality_info, dict) else "N/A"
-    coherence_status = coherence_info.get("status", "N/A") if isinstance(coherence_info, dict) else "N/A"
-
-    # Summary Cards Grid
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    with col1:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
         result_summary_card(
-            "賽事",
-            match_display,
-            match_info.get("competition", "未指定"),
+            "正式推薦數",
+            str(len(rec_list)),
+            "符合政策之最優選盤",
+            css_class="status-pass" if rec_list else "status-caution",
+        )
+    with c2:
+        result_summary_card(
+            "總候選盤數",
+            str(len(cand_list)),
+            "所有有效 HKJC 盤口",
+        )
+    with c3:
+        q_status = quality_info.get("status", "UNKNOWN")
+        result_summary_card(
+            "模型品質",
+            status_chinese(q_status),
+            f"分數: {quality_info.get('score', '—')}",
+            css_class=status_css_class(q_status),
+        )
+    with c4:
+        c_status = coherence_info.get("status", "UNKNOWN")
+        result_summary_card(
+            "HT-FT 一致性",
+            status_chinese(c_status),
+            f"違反程度: {coherence_info.get('violation', '—')}",
+            css_class=status_css_class(c_status),
         )
 
-    with col2:
-        result_summary_card(
-            "候選盤數目",
-            f"{len(candidates)} 個",
-            "已被分析盤口",
-        )
-
-    with col3:
-        result_summary_card(
-            "正式推薦",
-            f"{len(recs)} 項",
-            "符合品質閘門及下限",
-            css_class="status-pass" if recs else "status-caution",
-        )
-
-    with col4:
-        result_summary_card(
-            "模型品質閘門",
-            status_chinese(quality_status),
-            "模型擬合與驗證",
-            css_class=status_css_class(quality_status),
-        )
-
-    with col5:
-        result_summary_card(
-            "HT–FT 一致性",
-            status_chinese(coherence_status),
-            "半全場結構審核",
-            css_class=status_css_class(coherence_status),
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Main Tabs
-    tab_official, tab_candidates, tab_scores, tab_audit, tab_publish, tab_export = st.tabs([
-        "🎯 正式推薦",
-        "📊 所有候選盤",
-        "⚽ 波膽預測",
-        "🧪 壓力與一致性審核",
-        "🚀 VIP Portal 發佈",
-        "💾 導出 JSON",
+    res_tab1, res_tab2, res_tab3, res_tab4, res_tab5 = st.tabs([
+        "🏆 正式推薦",
+        "🎯 候選盤測試與手動篩選 (Client Selection)",
+        "📋 完整數據表",
+        "🎲 波膽推薦 (Correct Scores)",
+        "🚀 發佈至 VIP Centre",
     ])
 
-    with tab_official:
-        st.markdown("### 🎯 正式推薦項目 (Official Picks)")
-        if not recs:
-            st.info("本場賽事沒有候選盤達到正式推薦標準。")
+    with res_tab1:
+        st.subheader("正式推薦項目 (Official Picks)")
+        if not rec_list:
+            st.info("沒有候選盤通過正式推薦閘門條件。")
         else:
-            for rec in recs:
+            for rec in rec_list:
                 recommendation_card(rec)
 
-    with tab_candidates:
-        st.markdown("### 📊 所有候選盤詳細數據")
-        if candidates:
-            df_candidates = candidate_dataframe(candidates)
-            st.dataframe(
-                df_candidates,
-                use_container_width=True,
-                height=450,
-            )
-        else:
-            st.info("沒有候選盤數據。")
-
-    with tab_scores:
-        st.markdown("### ⚽ 波膽與比分概率")
-        correct_scores = result.get("correct_scores", {})
-        if isinstance(correct_scores, dict) and "recommendations" in correct_scores:
-            score_recs = correct_scores.get("recommendations", [])
-            if score_recs:
-                score_cols = st.columns(min(len(score_recs), 4))
-                for idx, score_item in enumerate(score_recs):
-                    col_idx = idx % min(len(score_recs), 4)
-                    with score_cols[col_idx]:
-                        s_val = score_item.get("score", "—")
-                        s_prob = score_item.get("probability", {}).get("minimum")
-                        st.markdown(
-                            f"""
-                            <div class="score-card">
-                                <div class="summary-label">波膽推介 #{idx + 1}</div>
-                                <div class="score-value">{html_escape(s_val)}</div>
-                                <div class="score-probability">保守概率：{format_probability(s_prob)}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown("<br>", unsafe_allow_html=True)
-
-            score_grid = correct_scores.get("matrix") or correct_scores.get("probabilities")
-            if score_grid and isinstance(score_grid, list):
-                st.markdown("#### 波膽概率矩陣")
-                st.dataframe(pd.DataFrame(score_grid), use_container_width=True)
-        else:
-            st.info("無波膽模型數據。")
-
-    with tab_audit:
-        st.markdown("### 🧪 模型品質與壓力測試審核")
-
-        c_left, c_right = st.columns(2)
-        with c_left:
-            st.markdown("#### 模型品質 Gate")
-            if isinstance(quality_info, dict):
-                st.json(quality_info)
-            else:
-                st.write("無品質審核數據。")
-
-        with c_right:
-            st.markdown("#### 半全場 HT–FT 一致性")
-            if isinstance(coherence_info, dict):
-                st.json(coherence_info)
-            else:
-                st.write("無半全場一致性數據。")
-
-        st.markdown("#### 個別候選盤壓力測試")
-        if candidates:
-            selected_cand_id = st.selectbox(
-                "選擇候選盤查看壓力測試",
-                options=[item_identity(c) or c.get("label", f"Candidate {i}") for i, c in enumerate(candidates)],
-                key="audit_cand_select",
-            )
-            selected_cand = next(
-                (c for c in candidates if (item_identity(c) or c.get("label")) == selected_cand_id),
-                None,
-            )
-            if selected_cand and "stress_audit" in selected_cand:
-                st.dataframe(stress_dataframe(selected_cand), use_container_width=True)
-            else:
-                st.info("選擇的候選盤沒有壓力測試數據。")
-
-    with tab_publish:
-        st.markdown("### 🚀 發佈至 VIP Match Centre")
-        st.markdown(
-            """
-            <div class="publish-panel">
-                將此場賽事的分析結果打包發佈到 VIP App Portal。<br>
-                將包含比賽資料、正式推薦、參考盤口、波膽預測及衝突關聯等。
-            </div>
-            """,
-            unsafe_allow_html=True,
+    with res_tab2:
+        st.subheader("🎯 候選盤測試與客戶手動推薦設定")
+        st.caption(
+            "在此可即時測試、手動為客戶挑選或覆蓋推薦項目，調整星級、重心標記及分析評語。"
         )
 
-        p_col1, p_col2 = st.columns(2)
+        if not cand_list:
+            st.info("暫無候選盤資料。")
+        else:
+            updated_cands = []
+            for idx, cand in enumerate(cand_list):
+                cand_id = item_identity(cand) or f"cand_{idx}"
+                label = cand.get("label", cand_id)
+                is_off = cand.get("official", False)
+                period = cand.get("period", "FT")
 
-        with p_col1:
-            match_id_inp = st.text_input(
-                "Match ID (留空自動生成)",
+                with st.expander(
+                    f"{'⭐ [正式]' if is_off else '🔹 [參考]'} {period} - {label} (ID: {cand_id})",
+                    expanded=is_off,
+                ):
+                    col_a, col_b, col_c = st.columns([2, 2, 2])
+                    with col_a:
+                        custom_official = st.checkbox(
+                            "列為推薦給客戶",
+                            value=is_off,
+                            key=f"manual_off_{cand_id}_{idx}",
+                        )
+                        custom_heavy = st.checkbox(
+                            "設為重心 (Heavy)",
+                            value=safe_bool(cand.get("is_heavy")),
+                            key=f"manual_heavy_{cand_id}_{idx}",
+                        )
+                    with col_b:
+                        custom_stars = st.slider(
+                            "推薦星級 (1-5)",
+                            min_value=1,
+                            max_value=5,
+                            value=max(1, min(5, safe_int(cand.get("stars"), 3))),
+                            key=f"manual_stars_{cand_id}_{idx}",
+                        )
+                    with col_c:
+                        custom_rank = st.number_input(
+                            "推薦排名",
+                            min_value=1,
+                            max_value=20,
+                            value=safe_int(cand.get("rank", idx + 1), idx + 1),
+                            key=f"manual_rank_{cand_id}_{idx}",
+                        )
+
+                    custom_comment = st.text_area(
+                        "針對客戶的客製化分析與建議 (Commentary)",
+                        value=candidate_commentary(cand),
+                        key=f"manual_comment_{cand_id}_{idx}",
+                    )
+
+                    cand_copy = deepcopy(cand)
+                    cand_copy["official"] = custom_official
+                    cand_copy["is_heavy"] = custom_heavy
+                    cand_copy["stars"] = custom_stars
+                    cand_copy["rank"] = custom_rank
+                    cand_copy["commentary"] = custom_comment
+                    updated_cands.append(cand_copy)
+
+            if st.button("💾 更新客戶推薦與測試設定", type="primary", key="save_manual_selection"):
+                current_result["candidate_markets"] = updated_cands
+                current_result["recommendations"] = [
+                    c for c in updated_cands if c.get("official")
+                ]
+                st.session_state.ultra_result = current_result
+                st.success("已更新手動推薦與測試設定！")
+                st.rerun()
+
+    with res_tab3:
+        st.subheader("📋 完整候選盤數據")
+        if cand_list:
+            df_cands = candidate_dataframe(cand_list)
+            st.dataframe(df_cands, use_container_width=True)
+
+            st.download_button(
+                "📥 下載候選盤數據 (JSON)",
+                data=json_text(cand_list),
+                file_name=download_name("candidate_markets"),
+                mime="application/json",
+            )
+        else:
+            st.info("無候選盤數據。")
+
+    with res_tab4:
+        st.subheader("🎲 波膽分析 (Correct Scores)")
+        cs_info = current_result.get("correct_scores", {})
+        cs_recs = cs_info.get("recommendations", []) if isinstance(cs_info, dict) else []
+
+        if not cs_recs:
+            st.info("無波膽推薦數據。")
+        else:
+            cols = st.columns(min(len(cs_recs), 4))
+            for i, score_rec in enumerate(cs_recs):
+                with cols[i % len(cols)]:
+                    score_val = score_rec.get("score", "—")
+                    prob_val = probability_value(score_rec, "hit", "minimum")
+                    st.markdown(
+                        f"""
+                        <div class="score-card">
+                            <div class="summary-label">波膽組合</div>
+                            <div class="score-value">{html_escape(score_val)}</div>
+                            <div class="score-probability">保守概率: {format_probability(prob_val)}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+    with res_tab5:
+        st.subheader("🚀 發佈至 VIP Centre (VIP Match Centre)")
+        st.caption("將目前的分析結果、覆蓋推薦及衝突資料發佈至 VIP Centre 數據庫。")
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            match_id_override = st.text_input(
+                "Match ID (自訂或留空自動產生)",
                 value="",
-                help="自訂或留空自動導出 stable_match_id",
+                placeholder="例如: match_20260815_001",
                 key="pub_match_id",
             )
-
             pub_status = st.selectbox(
-                "發佈狀態 (Status)",
+                "發佈狀態 (Publish Status)",
                 options=["published", "draft", "archived"],
                 index=0,
-                key="pub_status",
+                key="pub_status_sel",
             )
-
-            pub_alts = st.checkbox(
-                "包含參考盤口 (Alternative Picks)",
-                value=True,
-                key="pub_alts",
-            )
-
-            pub_cs = st.checkbox(
-                "包含波膽推介 (Correct Score Picks)",
-                value=True,
-                key="pub_cs",
-            )
-
-        with p_col2:
-            model_dir_inp = st.text_area(
-                "自訂 VIP 賽事方向 / 獨家分析 (Model Direction)",
-                value="",
-                placeholder="例如：主隊近況強勁，全場讓球及大球值得關注……（留空則不會強行覆蓋）",
-                height=150,
+        with col_p2:
+            model_dir_override = st.text_area(
+                "手動輸入推薦方向 (Model Direction Override)",
+                value=actual_model_direction(
+                    current_result,
+                    build_input_candidate_lookup(current_input),
+                ),
+                height=100,
                 key="pub_model_dir",
             )
 
-        st.markdown("#### 預覽即將發佈的 Bundle Payload")
-        try:
-            bundle_preview = build_portal_bundle(
-                result=result,
-                input_snapshot=input_snapshot,
-                publish_alternatives=pub_alts,
-                publish_correct_scores=pub_cs,
-                publish_status=pub_status,
-                match_id_override=match_id_inp,
-                model_direction_override=model_dir_inp,
-            )
-            with st.expander("檢視完整發佈 JSON Bundle", expanded=False):
-                st.json(bundle_preview)
-        except Exception as bundle_err:
-            bundle_preview = None
-            st.error(f"Bundle 生成失敗：{bundle_err}")
+        col_opt1, col_opt2 = st.columns(2)
+        with col_opt1:
+            pub_alts = st.checkbox("包含參考盤 (Publish Alternatives)", value=True, key="pub_alts_chk")
+        with col_opt2:
+            pub_cs = st.checkbox("包含波膽 (Publish Correct Scores)", value=True, key="pub_cs_chk")
 
-        if st.button("🚀 立即發佈到 VIP App Portal", type="primary", use_container_width=True, key="pub_submit_btn"):
-            if bundle_preview:
+        bundle_payload = build_portal_bundle(
+            result=current_result,
+            input_snapshot=current_input,
+            publish_alternatives=pub_alts,
+            publish_correct_scores=pub_cs,
+            publish_status=pub_status,
+            match_id_override=match_id_override,
+            model_direction_override=model_dir_override,
+        )
+
+        with st.expander("🔍 檢視 VIP Portal 發佈 Payload (JSON)", expanded=False):
+            st.json(bundle_payload)
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("🚀 即時發佈至 VIP Centre API", type="primary", use_container_width=True, key="pub_api_btn"):
                 try:
-                    with st.spinner("正在將 Bundle 發佈到 VIP Match Centre API..."):
-                        api_res = portal_request(bundle_preview)
+                    with st.spinner("正在將 Bundle 發佈至 VIP Centre..."):
+                        api_res = portal_request(bundle_payload)
                         st.session_state.portal_last_response = api_res
                         st.success("🎉 發佈成功！VIP Match Centre 已更新。")
                         st.json(api_res)
                 except Exception as pub_err:
                     st.error(f"發佈失敗：{pub_err}")
 
-        if st.session_state.get("portal_last_response"):
-            with st.expander("上次 API 回傳結果", expanded=False):
-                st.json(st.session_state.portal_last_response)
-
-    with tab_export:
-        st.markdown("### 💾 導出完整分析 JSON")
-        st.caption("您可以下載完整分析結果 JSON 檔案以備存檔或進行離線分析。")
-
-        d_col1, d_col2 = st.columns(2)
-        with d_col1:
+        with col_btn2:
             st.download_button(
-                "⬇️ 下載引擎分析結果 (Result JSON)",
-                data=json_text(result),
-                file_name=download_name("aegis_ultra_result"),
-                mime="application/json",
-                use_container_width=True,
-            )
-        with d_col2:
-            st.download_button(
-                "⬇️ 下載輸入數據快照 (Input JSON)",
-                data=json_text(input_snapshot),
-                file_name=download_name("aegis_ultra_input_snapshot"),
+                "📥 下載 VIP Bundle JSON",
+                data=json_text(bundle_payload),
+                file_name=download_name("vip_portal_bundle"),
                 mime="application/json",
                 use_container_width=True,
             )
